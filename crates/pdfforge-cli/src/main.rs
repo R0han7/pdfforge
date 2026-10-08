@@ -2,7 +2,10 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use pdfforge_core::{Document, Rotation, format_page_ranges, parse_page_ranges};
+use pdfforge_core::{
+    Allow, CompressOptions, Document, FieldKind, FieldValue, NormRect, Protection, Rotation, StampFont,
+    format_page_ranges, parse_page_ranges,
+};
 
 const USAGE: &str = "\
 Usage: pdfforge <command> [args] [options]
@@ -29,12 +32,32 @@ Edit (writes <name>-<command>.pdf next to the input unless -o or --in-place):
   split   <file.pdf> (--every N | --ranges \"1-3;4-6\") [-o DIR]
                                          Split into several files
 
+Forms, signatures and security (edit commands, same output rules):
+  fields  <file.pdf>                     List form fields, their types, values and options
+  fill    <file.pdf> NAME=VALUE... [--flatten]
+                                         Fill form fields (checkboxes: yes/no; radio and
+                                         dropdowns: the option name)
+  flatten <file.pdf> [-p PAGES]          Make form fields and annotations part of the page
+  sign    <file.pdf> (--image sig.png | --text \"Your Name\") [-p PAGES]
+          [--rect X,Y,W,H] [--font NAME] [--color #rrggbb]
+                                         Place a visual signature (default: bottom right of
+                                         the last page). --rect is in points from the
+                                         top-left of the page. Not a certificate signature.
+  protect <file.pdf> [--user-password PW] [--owner-password PW] [--allow LIST]
+                                         Encrypt with AES-256. LIST: print,copy,modify,
+                                         annotate,forms,assemble or none (default: all)
+  unprotect <file.pdf> --password PW     Remove the password and restrictions
+  compress <file.pdf> [--preset screen|print|smallest|lossless] [--dpi N] [--quality N]
+                                         Shrink the file (default preset: screen)
+
 PAGES (one-based): 1-3,5  8-  -4  last  odd  even  all  (default: all)
 
 Options:
   -o, --output <path>   Output file (or directory for render/split)
       --in-place        Overwrite the input file (edit commands)
       --password <pw>   Password for encrypted PDFs
+                        A password of \"-\" is read from standard input instead (passwords on
+                        the command line can be seen by other users of this computer).
   -h, --help            Show this help
 
 PDFium is loaded from $PDFIUM_LIB_PATH, next to the executable, or the system path.";
@@ -78,6 +101,17 @@ struct Args {
     every: Option<usize>,
     ranges: Option<String>,
     at: Option<usize>,
+    flatten: bool,
+    image: Option<PathBuf>,
+    text: Option<String>,
+    font: Option<String>,
+    rect: Option<String>,
+    color: Option<String>,
+    user_password: Option<String>,
+    owner_password: Option<String>,
+    allow: Option<String>,
+    preset: Option<String>,
+    quality: Option<u8>,
 }
 
 fn parse_args(raw: Vec<OsString>) -> Result<Args, String> {
@@ -115,6 +149,27 @@ fn parse_args(raw: Vec<OsString>) -> Result<Args, String> {
             Some("--every") => a.every = Some(num(val(&mut it, "--every")?, "--every")?),
             Some("--ranges") => a.ranges = Some(text(val(&mut it, "--ranges")?, "--ranges")?),
             Some("--at") => a.at = Some(num(val(&mut it, "--at")?, "--at")?),
+            Some("--flatten") => a.flatten = true,
+            Some("--image") => a.image = Some(val(&mut it, "--image")?.into()),
+            Some("--text") => a.text = Some(text(val(&mut it, "--text")?, "--text")?),
+            Some("--font") => a.font = Some(text(val(&mut it, "--font")?, "--font")?),
+            Some("--rect") => a.rect = Some(text(val(&mut it, "--rect")?, "--rect")?),
+            Some("--color") => a.color = Some(text(val(&mut it, "--color")?, "--color")?),
+            Some("--user-password") => {
+                a.user_password = Some(text(val(&mut it, "--user-password")?, "--user-password")?)
+            }
+            Some("--owner-password") => {
+                a.owner_password = Some(text(val(&mut it, "--owner-password")?, "--owner-password")?)
+            }
+            Some("--allow") => a.allow = Some(text(val(&mut it, "--allow")?, "--allow")?),
+            Some("--preset") => a.preset = Some(text(val(&mut it, "--preset")?, "--preset")?),
+            Some("--quality") => {
+                let q = num(val(&mut it, "--quality")?, "--quality")?;
+                if !(1..=100).contains(&q) {
+                    return Err("--quality must be between 1 and 100".into());
+                }
+                a.quality = Some(q as u8);
+            }
             Some(s) if s.starts_with('-') && s.len() > 1 && s.parse::<i32>().is_err() => {
                 return Err(format!("unknown option {s} (see --help)"));
             }
@@ -306,6 +361,155 @@ fn run(raw: Vec<OsString>) -> Result<(), String> {
                 out!("Wrote {} ({} {label})", out.display(), if part.page_count() == 1 { "page" } else { "pages" });
             }
         }
+        "fields" => {
+            need(&a, 1, "input file")?;
+            let d = open(&a, 0)?;
+            let fields = d.form_fields().map_err(e)?;
+            if fields.is_empty() {
+                eprintln!("no form fields");
+            }
+            for f in &fields {
+                let page = f.widgets.first().map(|w| (w.page + 1).to_string()).unwrap_or_else(|| "-".into());
+                let mut extra = Vec::new();
+                if !f.options.is_empty() {
+                    extra.push(format!("options: {}", f.options.join(" | ")));
+                }
+                if matches!(f.kind, FieldKind::Radio) {
+                    let states: Vec<String> = f.widgets.iter().filter_map(|w| w.on_state.clone()).collect();
+                    extra.push(format!("options: {}", states.join(" | ")));
+                }
+                if f.read_only {
+                    extra.push("read-only".into());
+                }
+                if f.required {
+                    extra.push("required".into());
+                }
+                let value = match f.kind {
+                    FieldKind::Checkbox => if f.checked { "yes" } else { "no" }.to_string(),
+                    _ => format!("{:?}", f.value),
+                };
+                let extra = if extra.is_empty() { String::new() } else { format!("  [{}]", extra.join("; ")) };
+                out!("p.{page:<4} {:<9} {} = {value}{extra}", f.kind.label(), f.name);
+            }
+        }
+        "fill" => {
+            need(&a, 2, "input file and at least one NAME=VALUE")?;
+            let mut d = open(&a, 0)?;
+            let fields = d.form_fields().map_err(e)?;
+            let mut values = Vec::new();
+            for arg in &a.pos[1..] {
+                let arg = arg.to_string_lossy();
+                let (name, value) = arg.split_once('=').ok_or_else(|| format!("'{arg}' should be NAME=VALUE"))?;
+                let f = fields.iter().find(|f| f.name == name).ok_or_else(|| {
+                    let names: Vec<&str> = fields.iter().map(|f| f.name.as_str()).collect();
+                    format!("no field named '{name}' (fields: {})", names.join(", "))
+                })?;
+                values.push((name.to_string(), FieldValue::parse_for(&f.kind, value).map_err(e)?));
+            }
+            d.fill_fields(&values).map_err(e)?;
+            if a.flatten {
+                d.flatten(None).map_err(e)?;
+            }
+            save_edit(&a, &cmd, &d)?;
+        }
+        "flatten" => {
+            need(&a, 1, "input file")?;
+            let mut d = open(&a, 0)?;
+            let sel = pages(a.pages.as_deref(), &d)?;
+            d.flatten(Some(&sel)).map_err(e)?;
+            save_edit(&a, &cmd, &d)?;
+        }
+        "sign" => {
+            need(&a, 1, "input file")?;
+            let mut d = open(&a, 0)?;
+            let n = d.page_count();
+            let sel = match &a.pages {
+                Some(p) => pages(Some(p), &d)?,
+                None => vec![n.saturating_sub(1)],
+            };
+            let color = match &a.color {
+                Some(c) => parse_color(c)?,
+                None => [0, 0, 0],
+            };
+            let image = match &a.image {
+                Some(p) => Some(image::open(p).map_err(|err| format!("cannot read {}: {err}", p.display()))?),
+                None => None,
+            };
+            if image.is_some() == a.text.is_some() {
+                return Err("sign: give exactly one of --image FILE or --text \"Your Name\"".into());
+            }
+            let font = match &a.font {
+                Some(f) => StampFont::ALL
+                    .into_iter()
+                    .find(|x| x.name().eq_ignore_ascii_case(f) || x.name().replace(' ', "").eq_ignore_ascii_case(f))
+                    .ok_or_else(|| {
+                        let names: Vec<&str> = StampFont::ALL.iter().map(|f| f.name()).collect();
+                        format!("unknown font '{f}' (fonts: {})", names.join(", "))
+                    })?,
+                None => StampFont::default(),
+            };
+            for p in sel {
+                let (pw, ph) = d.page_size(p).map_err(e)?;
+                let aspect = image.as_ref().map(|i| i.height() as f32 / i.width().max(1) as f32);
+                let rect = sign_rect(a.rect.as_deref(), pw, ph, aspect)?;
+                match &image {
+                    Some(img) => d.stamp_image(p, rect, img).map_err(e)?,
+                    None => d.stamp_text(p, rect, a.text.as_deref().unwrap_or(""), font, color).map_err(e)?,
+                }
+            }
+            save_edit(&a, &cmd, &d)?;
+        }
+        "protect" => {
+            need(&a, 1, "input file")?;
+            let mut d = open(&a, 0)?;
+            let user = a.user_password.clone().map(read_secret).transpose()?.unwrap_or_default();
+            let owner = a.owner_password.clone().map(read_secret).transpose()?.unwrap_or_default();
+            if user.is_empty() && owner.is_empty() {
+                return Err(
+                    "protect: give --user-password (to open) and/or --owner-password (to change permissions)".into()
+                );
+            }
+            let allow = match &a.allow {
+                Some(list) => parse_allow(list)?,
+                None => Allow::ALL,
+            };
+            d.protect(&Protection { user_password: user, owner_password: owner, allow }).map_err(e)?;
+            save_edit(&a, &cmd, &d)?;
+        }
+        "unprotect" => {
+            need(&a, 1, "input file")?;
+            let mut d = open(&a, 0)?;
+            if !d.security().map_err(e)?.encrypted {
+                eprintln!("note: {} is not protected", a.pos[0].to_string_lossy());
+            }
+            d.unprotect().map_err(e)?;
+            save_edit(&a, &cmd, &d)?;
+        }
+        "compress" => {
+            need(&a, 1, "input file")?;
+            let mut d = open(&a, 0)?;
+            let name = a.preset.as_deref().unwrap_or("screen");
+            let mut opts = CompressOptions::preset(name)
+                .ok_or_else(|| format!("unknown preset '{name}' (screen, print, smallest, lossless)"))?;
+            if let Some(dpi) = a.dpi {
+                opts.image_dpi = Some(dpi);
+                opts.recompress_images = true;
+            }
+            if let Some(q) = a.quality {
+                opts.jpeg_quality = q;
+                opts.recompress_images = true;
+            }
+            let r = d.compress(&opts).map_err(e)?;
+            eprintln!(
+                "{} -> {} ({:.0}% smaller), {} of {} images recompressed",
+                human(r.before),
+                human(r.after),
+                100.0 * (1.0 - r.after as f64 / r.before.max(1) as f64),
+                r.images_recompressed,
+                r.images_total
+            );
+            save_edit(&a, &cmd, &d)?;
+        }
         other => return Err(format!("unknown command '{other}' (see --help)")),
     }
     Ok(())
@@ -313,7 +517,8 @@ fn run(raw: Vec<OsString>) -> Result<(), String> {
 
 fn open(a: &Args, i: usize) -> Result<Document, String> {
     let path = Path::new(&a.pos[i]);
-    Document::open(path, a.password.as_deref()).map_err(|e| match e {
+    let pw = a.password.clone().map(read_secret).transpose()?;
+    Document::open(path, pw.as_deref()).map_err(|e| match e {
         pdfforge_core::Error::Io(err) => format!("cannot read {}: {err}", path.display()),
         pdfforge_core::Error::Pdfium(_) => format!("{} is not a valid PDF ({e})", path.display()),
         e => format!("{}: {e}", path.display()),
@@ -361,6 +566,83 @@ fn save_image(bmp: &pdfforge_core::Bitmap, out: &Path, jpg: bool) -> Result<(), 
     res.map_err(|e| format!("cannot write {}: {e}", out.display()))
 }
 
+/// "-" means: read one line from standard input.
+fn read_secret(v: String) -> Result<String, String> {
+    if v != "-" {
+        return Ok(v);
+    }
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line).map_err(|e| format!("cannot read password: {e}"))?;
+    Ok(line.trim_end_matches(['\r', '\n']).to_string())
+}
+
+fn parse_color(s: &str) -> Result<[u8; 3], String> {
+    let h = s.trim().trim_start_matches('#');
+    let bad = || format!("'{s}' is not a colour like #1a2b3c");
+    if h.len() != 6 || !h.is_ascii() {
+        return Err(bad());
+    }
+    let c = |i: usize| u8::from_str_radix(&h[i..i + 2], 16).map_err(|_| bad());
+    Ok([c(0)?, c(2)?, c(4)?])
+}
+
+fn parse_allow(list: &str) -> Result<Allow, String> {
+    let mut a = Allow::NONE;
+    for item in list.split(',').map(|s| s.trim().to_ascii_lowercase()).filter(|s| !s.is_empty()) {
+        match item.as_str() {
+            "none" => {}
+            "all" => a = Allow::ALL,
+            "print" => a.print = true,
+            "copy" => a.copy = true,
+            "modify" | "edit" => a.modify = true,
+            "annotate" | "comment" => a.annotate = true,
+            "forms" | "fill" => a.fill_forms = true,
+            "assemble" | "pages" => a.assemble = true,
+            other => {
+                return Err(format!(
+                    "unknown permission '{other}' (print, copy, modify, annotate, forms, assemble, none)"
+                ));
+            }
+        }
+    }
+    Ok(a)
+}
+
+/// Signature box on a `pw` × `ph` pt page: `--rect X,Y,W,H` in points from the top-left, or a
+/// 2.5 × 0.75 in box at the bottom right. Images keep their aspect ratio inside the box.
+fn sign_rect(spec: Option<&str>, pw: f32, ph: f32, aspect: Option<f32>) -> Result<NormRect, String> {
+    let (x, y, mut w, mut h) = match spec {
+        Some(s) => {
+            let v: Vec<f32> = s
+                .split(',')
+                .map(|n| n.trim().parse::<f32>())
+                .collect::<Result<_, _>>()
+                .map_err(|_| format!("--rect '{s}' should be X,Y,W,H in points, e.g. 350,650,180,50"))?;
+            if v.len() != 4 || v[2] <= 0.0 || v[3] <= 0.0 {
+                return Err(format!("--rect '{s}' should be X,Y,W,H with positive width and height"));
+            }
+            (v[0], v[1], v[2], v[3])
+        }
+        None => (pw - 54.0 - 180.0, ph - 54.0 - 54.0, 180.0, 54.0),
+    };
+    if let Some(a) = aspect {
+        // Fit the image inside the box.
+        if h / w > a { h = w * a } else { w = h / a }
+    }
+    if x < 0.0 || y < 0.0 || x + w > pw + 0.5 || y + h > ph + 0.5 {
+        return Err(format!("signature box {x},{y},{w},{h} is outside the {pw:.0} x {ph:.0} pt page"));
+    }
+    Ok(NormRect { x0: x / pw, y0: y / ph, x1: (x + w) / pw, y1: (y + h) / ph })
+}
+
+fn human(n: usize) -> String {
+    match n {
+        n if n >= 1 << 20 => format!("{:.1} MB", n as f64 / (1 << 20) as f64),
+        n if n >= 1 << 10 => format!("{:.0} KB", n as f64 / 1024.0),
+        n => format!("{n} B"),
+    }
+}
+
 /// Common paper names for `info`, matched within 3 pt in either orientation.
 fn paper_name(w: f32, h: f32) -> String {
     const SIZES: &[(&str, f32, f32)] = &[
@@ -398,6 +680,61 @@ mod tests {
         assert!(parse_args(args(&["text", "-p"])).is_err());
         // "-4" is a page range, not an option.
         assert_eq!(parse_args(args(&["extract", "x.pdf", "-4"])).unwrap().pos.len(), 3);
+    }
+
+    #[test]
+    fn parses_sign_and_security_options() {
+        assert_eq!(parse_color("#ff8000").unwrap(), [255, 128, 0]);
+        assert!(parse_color("red").is_err());
+        let a = parse_allow("print, forms").unwrap();
+        assert!(a.print && a.fill_forms && !a.copy && !a.modify);
+        assert_eq!(parse_allow("none").unwrap(), Allow::NONE);
+        assert!(parse_allow("fly").is_err());
+        let r = sign_rect(None, 612.0, 792.0, None).unwrap();
+        assert!(r.x1 < 1.0 && r.y1 < 1.0 && r.x0 > 0.5 && r.y0 > 0.8, "{r:?}");
+        // A 2:1 image in a 200x50 box becomes 100x50.
+        let r = sign_rect(Some("0,0,200,50"), 612.0, 792.0, Some(0.5)).unwrap();
+        assert!(((r.x1 - r.x0) * 612.0 - 100.0).abs() < 0.01);
+        assert!(sign_rect(Some("600,0,100,50"), 612.0, 792.0, None).is_err());
+        assert!(sign_rect(Some("1,2,3"), 612.0, 792.0, None).is_err());
+        assert_eq!(human(1536), "2 KB");
+    }
+
+    #[test]
+    fn end_to_end_forms_and_security() {
+        let dir = std::env::temp_dir().join(format!("pdfforge-cli-forms-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = |s: &str| dir.join(s).to_string_lossy().into_owned();
+        let fixture = concat!(env!("CARGO_MANIFEST_DIR"), "/../pdfforge-core/tests/fixtures/form.pdf");
+        std::fs::copy(fixture, dir.join("f.pdf")).unwrap();
+
+        run(args(&["fill", &p("f.pdf"), "name=Ada", "subscribe=yes", "plan=pro", "-o", &p("filled.pdf")])).unwrap();
+        let fs = Document::open(dir.join("filled.pdf"), None).unwrap().form_fields().unwrap();
+        assert_eq!(fs[0].value, "Ada");
+        assert!(fs[2].checked);
+        assert!(run(args(&["fill", &p("f.pdf"), "plan=gold"])).is_err());
+        assert!(run(args(&["fill", &p("f.pdf"), "noequals"])).is_err());
+
+        run(args(&["sign", &p("filled.pdf"), "--text", "Ada L", "-p", "1", "-o", &p("signed.pdf")])).unwrap();
+        assert!(Document::open(dir.join("signed.pdf"), None).unwrap().text(0).unwrap().contains("Ada L"));
+        assert!(run(args(&["sign", &p("filled.pdf")])).is_err(), "needs --text or --image");
+
+        run(args(&["protect", &p("signed.pdf"), "--user-password", "pw", "--allow", "print", "-o", &p("lock.pdf")]))
+            .unwrap();
+        assert!(Document::open(dir.join("lock.pdf"), None).is_err());
+        run(args(&["unprotect", &p("lock.pdf"), "--password", "pw", "-o", &p("open.pdf")])).unwrap();
+        assert!(!Document::open(dir.join("open.pdf"), None).unwrap().security().unwrap().encrypted);
+
+        run(args(&["compress", &p("open.pdf"), "--preset", "lossless", "-o", &p("small.pdf")])).unwrap();
+        assert!(
+            std::fs::metadata(dir.join("small.pdf")).unwrap().len()
+                <= std::fs::metadata(dir.join("open.pdf")).unwrap().len()
+        );
+        assert!(run(args(&["compress", &p("open.pdf"), "--preset", "tiny"])).is_err());
+
+        run(args(&["flatten", &p("filled.pdf"), "-o", &p("flat.pdf")])).unwrap();
+        assert!(Document::open(dir.join("flat.pdf"), None).unwrap().form_fields().unwrap().is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

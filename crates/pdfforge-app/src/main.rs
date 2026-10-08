@@ -1,6 +1,7 @@
 //! PDF Forge desktop app: continuous-scroll PDF viewer with thumbnails, bookmarks, search,
 //! and page tools (rotate, delete, reorder, insert, extract, split, merge) with undo.
 
+mod sign;
 mod view;
 
 use std::collections::HashMap;
@@ -11,7 +12,12 @@ use eframe::egui::{
     self, Align, Color32, ColorImage, Id, Key, KeyboardShortcut, Modifiers, Pos2, Rect, RichText, ScrollArea, Sense,
     Stroke, StrokeKind, TextureHandle, TextureOptions, Vec2,
 };
-use pdfforge_core::{Document, Error, OutlineItem, Rotation, SearchHit, parse_page_ranges};
+use pdfforge_core::{
+    Allow, CompressOptions, Document, Error, FieldKind, FieldValue, FormField, NormRect, OutlineItem, Protection,
+    Rotation, SearchHit, parse_page_ranges,
+};
+
+use sign::{SignDialog, SignOutcome, Signature};
 
 use view::{GAP, Layout, Selection, moved_order, positions_of};
 
@@ -79,10 +85,15 @@ struct Open {
     pages: HashMap<usize, Tex>,
     thumbs: HashMap<usize, TextureHandle>,
     selection: Selection,
-    undo: Vec<Vec<u8>>,
-    redo: Vec<Vec<u8>>,
+    /// Snapshots for undo/redo: document bytes and the password needed to open them.
+    undo: Vec<Snapshot>,
+    redo: Vec<Snapshot>,
     dirty: bool,
+    fields: Vec<FormField>,
+    encrypted: bool,
 }
+
+type Snapshot = (Vec<u8>, Option<String>);
 
 impl Open {
     fn new(doc: Document, path: Option<PathBuf>) -> Self {
@@ -97,6 +108,8 @@ impl Open {
             undo: Vec::new(),
             redo: Vec::new(),
             dirty: false,
+            fields: Vec::new(),
+            encrypted: false,
         };
         o.refresh();
         o
@@ -109,6 +122,12 @@ impl Open {
         self.pages.clear();
         self.thumbs.clear();
         self.selection = Selection::new(n);
+        self.fields = if self.doc.has_form() { self.doc.form_fields().unwrap_or_default() } else { Vec::new() };
+        self.encrypted = self.doc.info().encrypted;
+    }
+
+    fn snapshot(&self) -> pdfforge_core::Result<Snapshot> {
+        Ok((self.doc.to_bytes()?, self.doc.password().map(str::to_string)))
     }
 
     fn name(&self) -> String {
@@ -146,6 +165,67 @@ struct App {
     info_open: bool,
     viewport_size: Vec2,
     load_error: Option<String>,
+    // Forms
+    show_fields: bool,
+    editing: Option<TextEditing>,
+    choice: Option<ChoicePopup>,
+    // Signatures
+    sign_dialog: Option<SignDialog>,
+    /// Where a signature goes once created: a signature field's box, or `None` to place by hand.
+    sign_target: Option<(usize, NormRect)>,
+    placing: Option<Signature>,
+    // Security / optimisation dialogs
+    protect_dialog: Option<ProtectDialog>,
+    /// Selected preset and the document size when the dialog opened.
+    compress_dialog: Option<(usize, usize)>,
+    last_title: String,
+}
+
+/// A text field being edited in place.
+struct TextEditing {
+    name: String,
+    page: usize,
+    rect: NormRect,
+    text: String,
+    multiline: bool,
+    focus: bool,
+}
+
+/// An open dropdown / list field menu.
+struct ChoicePopup {
+    name: String,
+    options: Vec<String>,
+    current: String,
+    pos: Pos2,
+    width: f32,
+    opened: bool,
+}
+
+struct ProtectDialog {
+    user: String,
+    confirm: String,
+    owner: String,
+    allow: Allow,
+    error: Option<String>,
+}
+
+const COMPRESS_PRESETS: [(&str, &str, CompressOptions); 4] = [
+    ("Screen", "120 dpi images — e-mail and on-screen reading", CompressOptions::SCREEN),
+    ("Print", "200 dpi images, high quality — printing", CompressOptions::PRINT),
+    ("Smallest", "72 dpi images, lower quality, metadata removed", CompressOptions::SMALLEST),
+    ("Lossless", "No image changes — only removes waste", CompressOptions::LOSSLESS),
+];
+
+/// Something the user did on a page, applied after drawing.
+enum PageAction {
+    Toggle(String, bool),
+    Radio(String, String),
+    EditText(TextEditing),
+    Choose(ChoicePopup),
+    SignField(usize, NormRect),
+    Place(usize, NormRect),
+    CommitText,
+    CancelText,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -178,6 +258,15 @@ impl App {
             info_open: false,
             viewport_size: Vec2::ZERO,
             load_error: pdfforge_core::pdfium().err().map(|e| e.to_string()),
+            show_fields: true,
+            editing: None,
+            choice: None,
+            sign_dialog: None,
+            sign_target: None,
+            placing: None,
+            protect_dialog: None,
+            compress_dialog: None,
+            last_title: String::new(),
         };
         if let Some(p) = path {
             app.load(p, None);
@@ -253,6 +342,7 @@ impl App {
     }
 
     fn save(&mut self, ctx: &egui::Context, save_as: bool) {
+        self.commit_text();
         let Some(o) = &self.open else { return };
         let target = match (&o.path, save_as) {
             (Some(p), false) => Some(p.clone()),
@@ -284,7 +374,7 @@ impl App {
     /// Apply an edit with an undo snapshot. `f` returns the pages to select afterwards.
     fn edit(&mut self, what: &str, f: impl FnOnce(&mut Document) -> pdfforge_core::Result<Vec<usize>>) {
         let Some(o) = &mut self.open else { return };
-        let snapshot = match o.doc.to_bytes() {
+        let snapshot = match o.snapshot() {
             Ok(b) => b,
             Err(e) => return self.fail(format!("{what} failed: {e}")),
         };
@@ -307,6 +397,8 @@ impl App {
 
     fn after_change(&mut self) {
         self.generation += 1;
+        self.editing = None;
+        self.choice = None;
         let n = self.open.as_ref().map_or(0, |o| o.doc.page_count());
         self.current_page = self.current_page.min(n.saturating_sub(1));
         // Search results point at old page positions.
@@ -318,13 +410,16 @@ impl App {
 
     fn undo_redo(&mut self, redo: bool) {
         let Some(o) = &mut self.open else { return };
-        let (from, to) = if redo { (&mut o.redo, &mut o.undo) } else { (&mut o.undo, &mut o.redo) };
-        let Some(bytes) = from.pop() else { return };
-        let current = match o.doc.to_bytes() {
+        if (redo && o.redo.is_empty()) || (!redo && o.undo.is_empty()) {
+            return;
+        }
+        let current = match o.snapshot() {
             Ok(b) => b,
             Err(e) => return self.fail(format!("Undo failed: {e}")),
         };
-        match Document::from_bytes(bytes, None) {
+        let (from, to) = if redo { (&mut o.redo, &mut o.undo) } else { (&mut o.undo, &mut o.redo) };
+        let Some((bytes, password)) = from.pop() else { return };
+        match Document::from_bytes(bytes, password.as_deref()) {
             Ok(doc) => {
                 to.push(current);
                 o.doc = doc;
@@ -439,6 +534,117 @@ impl App {
         match result {
             Ok(k) => self.say(format!("Wrote {k} files to {}", dir.display())),
             Err(e) => self.fail(format!("Split failed: {e}")),
+        }
+    }
+
+    // ------------------------------------------------------------ forms, signatures, security
+
+    fn set_field(&mut self, name: &str, value: FieldValue) {
+        let what = format!("Filled “{name}”");
+        let pages = self.target_pages();
+        let v = vec![(name.to_string(), value)];
+        self.edit(&what, |d| d.fill_fields(&v).map(|()| pages.clone()));
+        if let Some(o) = &mut self.open {
+            o.selection.clear();
+        }
+    }
+
+    fn flatten_form(&mut self) {
+        self.edit("Flattened the form (fields are now part of the page)", |d| d.flatten(None).map(|()| vec![]));
+    }
+
+    /// Stamp a signature into `rect`; the signature keeps its proportions inside the box.
+    fn place_signature(&mut self, page: usize, rect: NormRect, sig: &Signature) {
+        let Some(o) = &self.open else { return };
+        let Some(&(pw, ph)) = o.sizes.get(page) else { return };
+        let rect = fit_aspect(rect, sig.aspect(), pw, ph);
+        self.edit(&format!("Signed page {}", page + 1), |d| {
+            match sig {
+                Signature::Ink { ink, .. } => d.stamp_ink(page, rect, ink)?,
+                Signature::Text { text, font, color } => d.stamp_text(page, rect, text, *font, *color)?,
+                Signature::Image { image, .. } => d.stamp_image(page, rect, image)?,
+            }
+            Ok(vec![])
+        });
+    }
+
+    fn start_signing(&mut self, target: Option<(usize, NormRect)>) {
+        self.sign_target = target;
+        self.sign_dialog.get_or_insert_with(SignDialog::default);
+    }
+
+    fn protect(&mut self, p: Protection) {
+        let what = if p.user_password.is_empty() {
+            "Restricted permissions (owner password set)"
+        } else {
+            "Protected with a password — it is encrypted when you save"
+        };
+        self.edit(what, |d| d.protect(&p).map(|()| vec![]));
+    }
+
+    fn unprotect(&mut self) {
+        self.edit("Removed the password and restrictions", |d| d.unprotect().map(|()| vec![]));
+    }
+
+    fn compress(&mut self, opts: CompressOptions) {
+        let mut report = None;
+        self.edit("Compressed", |d| {
+            report = Some(d.compress(&opts)?);
+            Ok(vec![])
+        });
+        if let Some(r) = report {
+            if r.after >= r.before {
+                self.say("This file is already as small as this setting can make it");
+            } else {
+                self.say(format!(
+                    "Compressed {} -> {} ({:.0}% smaller, {} of {} images) — save to keep it",
+                    human(r.before),
+                    human(r.after),
+                    100.0 * (1.0 - r.after as f64 / r.before.max(1) as f64),
+                    r.images_recompressed,
+                    r.images_total
+                ));
+            }
+        }
+    }
+
+    fn open_compress_dialog(&mut self) {
+        let size = self.open.as_ref().and_then(|o| o.doc.to_bytes().ok()).map_or(0, |b| b.len());
+        self.compress_dialog = Some((0, size));
+    }
+
+    fn apply_page_action(&mut self, a: PageAction) {
+        match a {
+            PageAction::Toggle(name, on) => self.set_field(&name, FieldValue::Checked(on)),
+            PageAction::Radio(name, state) => self.set_field(&name, FieldValue::Choice(state)),
+            PageAction::EditText(e) => {
+                self.commit_text();
+                self.editing = Some(e);
+            }
+            PageAction::Choose(c) => {
+                self.commit_text();
+                self.choice = Some(c);
+            }
+            PageAction::SignField(page, rect) => self.start_signing(Some((page, rect))),
+            PageAction::Place(page, rect) => {
+                if let Some(sig) = self.placing.take() {
+                    self.place_signature(page, rect, &sig);
+                }
+            }
+            PageAction::CommitText => self.commit_text(),
+            PageAction::CancelText => self.editing = None,
+        }
+    }
+
+    fn commit_text(&mut self) {
+        let Some(e) = self.editing.take() else { return };
+        let unchanged = self
+            .open
+            .as_ref()
+            .and_then(|o| o.fields.iter().find(|f| f.name == e.name))
+            .is_some_and(|f| f.value == e.text);
+        if !unchanged {
+            self.set_field(&e.name, FieldValue::Text(e.text));
         }
     }
 
@@ -629,10 +835,14 @@ impl App {
         if key(Key::Delete) {
             self.delete();
         }
-        if key(Key::Escape)
-            && let Some(o) = &mut self.open
-        {
-            o.selection.clear();
+        if key(Key::Escape) {
+            if self.placing.take().is_some() {
+                self.say("Signature placement cancelled");
+            } else if self.choice.take().is_none()
+                && let Some(o) = &mut self.open
+            {
+                o.selection.clear();
+            }
         }
         // Ctrl + mouse wheel zooms around the current page.
         let zd = ctx.input(|i| i.zoom_delta());
@@ -735,6 +945,7 @@ impl App {
                     }
                 });
                 ui.menu_button("Pages", |ui| self.page_tools_menu(ui));
+                ui.menu_button("Tools", |ui| self.tools_menu(ui));
             });
         });
     }
@@ -804,6 +1015,22 @@ impl App {
                 self.delete();
             }
             ui.separator();
+            if ui.button("Sign").on_hover_text("Draw, type or insert a signature and place it on a page").clicked() {
+                self.start_signing(None);
+            }
+            if ui.button("Protect").on_hover_text("Protect with a password (Tools menu)").clicked() {
+                self.protect_dialog = Some(ProtectDialog {
+                    user: String::new(),
+                    confirm: String::new(),
+                    owner: String::new(),
+                    allow: Allow::ALL,
+                    error: None,
+                });
+            }
+            if ui.button("Compress").on_hover_text("Compress to make the file smaller").clicked() {
+                self.open_compress_dialog();
+            }
+            ui.separator();
             if ui.button("◀").on_hover_text("Previous page").clicked() {
                 self.goto = Some(self.current_page.saturating_sub(1));
             }
@@ -864,7 +1091,9 @@ impl App {
                 }
             }
             ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
-                if let Some(s) = &self.status {
+                if self.placing.is_some() {
+                    ui.label(RichText::new("Click on a page to place your signature · Esc to cancel").strong());
+                } else if let Some(s) = &self.status {
                     let c = if s.error { ui.visuals().error_fg_color } else { ui.visuals().weak_text_color() };
                     ui.label(RichText::new(&s.text).color(c));
                 }
@@ -1093,12 +1322,13 @@ impl App {
             area = area.vertical_scroll_offset((top - GAP + hit_y).max(0.0));
             self.current_page = p;
         }
+        let mut actions = Vec::new();
         let out = area.show_viewport(ui, |ui, viewport| {
             let (rect, _) = ui.allocate_exact_size(Vec2::new(content_w, self.layout.total_height), Sense::hover());
             let visible = self.layout.visible(viewport.min.y, viewport.max.y);
             let more = self.render_visible(ui.ctx(), visible.clone());
             let Some(o) = &self.open else { return visible };
-            let painter = ui.painter();
+            let painter = ui.painter().clone();
             for i in visible.clone() {
                 let (w, h) = self.layout.sizes[i];
                 let page = Rect::from_min_size(
@@ -1136,6 +1366,133 @@ impl App {
                         }
                     }
                 }
+                let to_screen = |r: &NormRect| {
+                    Rect::from_min_max(
+                        Pos2::new(page.left() + r.x0 * w, page.top() + r.y0 * h),
+                        Pos2::new(page.left() + r.x1 * w, page.top() + r.y1 * h),
+                    )
+                };
+                if let Some(sig) = &self.placing {
+                    let resp = ui
+                        .interact(page, Id::new(("place", i)), Sense::click())
+                        .on_hover_cursor(egui::CursorIcon::Crosshair);
+                    if let Some(pos) = resp.hover_pos() {
+                        let (sw, sh) = sig.default_size_pt();
+                        let k = self.zoom * view::PT_TO_UI;
+                        let mut ghost = Rect::from_center_size(pos, Vec2::new(sw * k, sh * k));
+                        // Keep the whole signature on the page.
+                        ghost = ghost.translate(Vec2::new(
+                            (page.left() - ghost.left()).max(0.0) + (page.right() - ghost.right()).min(0.0),
+                            (page.top() - ghost.top()).max(0.0) + (page.bottom() - ghost.bottom()).min(0.0),
+                        ));
+                        painter.rect_filled(ghost, 2.0, Color32::from_rgba_unmultiplied(80, 140, 255, 30));
+                        painter.rect_stroke(
+                            ghost,
+                            2.0,
+                            Stroke::new(1.0, Color32::from_rgb(60, 110, 220)),
+                            StrokeKind::Outside,
+                        );
+                        sig.paint(&painter, ghost, 190);
+                        if resp.clicked() {
+                            let n = NormRect {
+                                x0: (ghost.left() - page.left()) / w,
+                                y0: (ghost.top() - page.top()) / h,
+                                x1: (ghost.right() - page.left()) / w,
+                                y1: (ghost.bottom() - page.top()) / h,
+                            };
+                            actions.push(PageAction::Place(i, n));
+                        }
+                    }
+                    continue;
+                }
+                for f in &o.fields {
+                    for (wi, wd) in f.widgets.iter().enumerate().filter(|(_, wd)| wd.page == i) {
+                        let fr = to_screen(&wd.rect);
+                        if f.read_only || matches!(f.kind, FieldKind::PushButton) || fr.width() < 2.0 {
+                            continue;
+                        }
+                        let editing_this = self.editing.as_ref().is_some_and(|e| e.name == f.name && e.page == i);
+                        if editing_this {
+                            continue;
+                        }
+                        let resp = ui.interact(fr, Id::new(("field", &f.name, wi)), Sense::click());
+                        let cursor = match f.kind {
+                            FieldKind::Text { .. } => egui::CursorIcon::Text,
+                            _ => egui::CursorIcon::PointingHand,
+                        };
+                        let resp = resp.on_hover_cursor(cursor).on_hover_text(field_tooltip(f));
+                        if self.show_fields {
+                            painter.rect_filled(fr, 1.0, Color32::from_rgba_unmultiplied(80, 140, 255, 26));
+                        }
+                        if resp.hovered() {
+                            painter.rect_stroke(
+                                fr,
+                                1.0,
+                                Stroke::new(1.5, Color32::from_rgb(60, 110, 220)),
+                                StrokeKind::Outside,
+                            );
+                        }
+                        if !resp.clicked() {
+                            continue;
+                        }
+                        actions.push(match &f.kind {
+                            FieldKind::Checkbox => PageAction::Toggle(f.name.clone(), !f.checked),
+                            FieldKind::Radio => match &wd.on_state {
+                                Some(s) if *s != f.value => PageAction::Radio(f.name.clone(), s.clone()),
+                                _ => continue,
+                            },
+                            FieldKind::Text { multiline, .. } => PageAction::EditText(TextEditing {
+                                name: f.name.clone(),
+                                page: i,
+                                rect: wd.rect,
+                                text: f.value.clone(),
+                                multiline: *multiline,
+                                focus: true,
+                            }),
+                            FieldKind::ComboBox { .. } | FieldKind::ListBox { .. } => PageAction::Choose(ChoicePopup {
+                                name: f.name.clone(),
+                                options: f.options.clone(),
+                                current: f.value.clone(),
+                                pos: fr.left_bottom(),
+                                width: fr.width(),
+                                opened: true,
+                            }),
+                            FieldKind::Signature => PageAction::SignField(i, wd.rect),
+                            FieldKind::PushButton => continue,
+                        });
+                    }
+                }
+                if let Some(ed) = self.editing.as_mut().filter(|e| e.page == i) {
+                    let fr = to_screen(&ed.rect);
+                    painter.rect_filled(fr, 0.0, Color32::WHITE);
+                    painter.rect_stroke(
+                        fr,
+                        0.0,
+                        Stroke::new(2.0, Color32::from_rgb(60, 110, 220)),
+                        StrokeKind::Outside,
+                    );
+                    let size = if ed.multiline { 12.0 * self.zoom * view::PT_TO_UI * 0.85 } else { fr.height() * 0.62 };
+                    let font = egui::FontId::proportional(size.clamp(7.0, 40.0));
+                    let edit = if ed.multiline {
+                        egui::TextEdit::multiline(&mut ed.text)
+                    } else {
+                        egui::TextEdit::singleline(&mut ed.text)
+                    };
+                    let r = ui.put(
+                        fr,
+                        edit.frame(egui::Frame::NONE)
+                            .font(font)
+                            .text_color(Color32::BLACK)
+                            .margin(egui::Margin::symmetric(3, 1)),
+                    );
+                    if ed.focus {
+                        r.request_focus();
+                        ed.focus = false;
+                    } else if r.lost_focus() {
+                        let esc = ui.input(|inp| inp.key_pressed(Key::Escape));
+                        actions.push(if esc { PageAction::CancelText } else { PageAction::CommitText });
+                    }
+                }
             }
             if more {
                 ui.ctx().request_repaint();
@@ -1145,6 +1502,54 @@ impl App {
         let off = out.state.offset.y;
         if !self.layout.tops.is_empty() {
             self.current_page = self.layout.current(off, off + out.inner_rect.height());
+        }
+        for a in actions {
+            self.apply_page_action(a);
+        }
+    }
+
+    fn form_bar(&mut self, ui: &mut egui::Ui) {
+        let n = self.open.as_ref().map_or(0, |o| o.fields.len());
+        ui.horizontal(|ui| {
+            ui.label(format!("📝 This document has a form ({n} fields). Click a field to fill it in."));
+            ui.checkbox(&mut self.show_fields, "Highlight fields");
+            if ui
+                .button("Flatten form")
+                .on_hover_text("Make the filled-in values part of the page so they can't be changed")
+                .clicked()
+            {
+                self.flatten_form();
+            }
+        });
+    }
+
+    fn tools_menu(&mut self, ui: &mut egui::Ui) {
+        if ui.button("Sign…").clicked() {
+            self.start_signing(None);
+        }
+        let (has_form, encrypted) = self.open.as_ref().map_or((false, false), |o| (!o.fields.is_empty(), o.encrypted));
+        ui.add_enabled_ui(has_form, |ui| {
+            ui.checkbox(&mut self.show_fields, "Highlight Form Fields");
+            if ui.button("Flatten Form").clicked() {
+                self.flatten_form();
+            }
+        });
+        ui.separator();
+        if ui.button("Protect with Password…").clicked() {
+            self.protect_dialog = Some(ProtectDialog {
+                user: String::new(),
+                confirm: String::new(),
+                owner: String::new(),
+                allow: Allow::ALL,
+                error: None,
+            });
+        }
+        if ui.add_enabled(encrypted, egui::Button::new("Remove Password")).clicked() {
+            self.unprotect();
+        }
+        ui.separator();
+        if ui.button("Compress…").clicked() {
+            self.open_compress_dialog();
         }
     }
 
@@ -1170,6 +1575,7 @@ impl App {
     // ------------------------------------------------------------ UI: windows
 
     fn windows(&mut self, ctx: &egui::Context) {
+        self.tool_windows(ctx);
         if let Some(action) = self.pending.clone() {
             let mut choice = None;
             egui::Modal::new(Id::new("unsaved")).show(ctx, |ui| {
@@ -1217,9 +1623,12 @@ impl App {
                     ui.colored_label(ui.visuals().error_fg_color, "That password is incorrect.");
                 }
                 let r = ui.add(egui::TextEdit::singleline(pw).password(true).hint_text("Password"));
-                r.request_focus();
+                if !r.has_focus() && !r.lost_focus() {
+                    r.request_focus();
+                }
+                let enter = ui.input(|i| i.key_pressed(Key::Enter));
                 ui.horizontal(|ui| {
-                    if ui.button("Open").clicked() || (r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter))) {
+                    if ui.button("Open").clicked() || enter {
                         submit = Some(true);
                     }
                     if ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(Key::Escape)) {
@@ -1303,6 +1712,146 @@ impl App {
         }
     }
 
+    fn tool_windows(&mut self, ctx: &egui::Context) {
+        if let Some(d) = &mut self.sign_dialog {
+            match d.show(ctx) {
+                SignOutcome::Open => {}
+                SignOutcome::Cancel => {
+                    self.sign_dialog = None;
+                    self.sign_target = None;
+                }
+                SignOutcome::Done(sig) => {
+                    self.sign_dialog = None;
+                    match self.sign_target.take() {
+                        Some((page, rect)) => self.place_signature(page, rect, &sig),
+                        None => self.placing = Some(sig),
+                    }
+                }
+            }
+        }
+
+        if let Some(c) = &mut self.choice {
+            let mut picked = None;
+            let area =
+                egui::Area::new(Id::new("choice")).order(egui::Order::Foreground).fixed_pos(c.pos).show(ctx, |ui| {
+                    egui::Frame::popup(ui.style()).show(ui, |ui| {
+                        ui.set_min_width(c.width.max(120.0));
+                        egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
+                            for opt in &c.options {
+                                if ui.selectable_label(*opt == c.current, opt).clicked() {
+                                    picked = Some(opt.clone());
+                                }
+                            }
+                        });
+                    });
+                });
+            let clicked_outside =
+                !c.opened && ctx.input(|i| i.pointer.any_pressed()) && !area.response.contains_pointer();
+            c.opened = false;
+            if let Some(v) = picked {
+                let name = c.name.clone();
+                self.choice = None;
+                self.set_field(&name, FieldValue::Choice(v));
+            } else if clicked_outside || ctx.input(|i| i.key_pressed(Key::Escape)) {
+                self.choice = None;
+            }
+        }
+
+        if let Some(d) = &mut self.protect_dialog {
+            let mut result = None;
+            egui::Modal::new(Id::new("protect")).show(ctx, |ui| {
+                ui.heading("Protect with a password");
+                egui::Grid::new("pw").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
+                    ui.label("Password to open");
+                    ui.add(egui::TextEdit::singleline(&mut d.user).password(true).hint_text("leave empty to allow anyone"));
+                    ui.end_row();
+                    ui.label("Confirm");
+                    ui.add(egui::TextEdit::singleline(&mut d.confirm).password(true));
+                    ui.end_row();
+                    ui.label("Owner password");
+                    ui.add(egui::TextEdit::singleline(&mut d.owner).password(true).hint_text("to change permissions"));
+                    ui.end_row();
+                });
+                ui.add_space(6.0);
+                ui.label(RichText::new("People who open it with the first password may:").strong());
+                ui.horizontal_wrapped(|ui| {
+                    ui.checkbox(&mut d.allow.print, "Print");
+                    ui.checkbox(&mut d.allow.copy, "Copy text");
+                    ui.checkbox(&mut d.allow.modify, "Edit");
+                    ui.checkbox(&mut d.allow.annotate, "Comment");
+                    ui.checkbox(&mut d.allow.fill_forms, "Fill forms");
+                    ui.checkbox(&mut d.allow.assemble, "Rearrange pages");
+                });
+                ui.label(
+                    RichText::new("Encryption: AES-256. Permissions are honoured by most PDF apps but are not enforced by the encryption itself.")
+                        .small()
+                        .weak(),
+                );
+                if let Some(e) = &d.error {
+                    ui.colored_label(ui.visuals().error_fg_color, e);
+                }
+                ui.horizontal(|ui| {
+                    if ui.button("Protect").clicked() {
+                        result = Some(true);
+                    }
+                    if ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(Key::Escape)) {
+                        result = Some(false);
+                    }
+                });
+            });
+            match result {
+                Some(true) => {
+                    if d.user != d.confirm {
+                        d.error = Some("The passwords don't match".into());
+                    } else if d.user.is_empty() && d.owner.is_empty() {
+                        d.error = Some("Enter a password to open, an owner password, or both".into());
+                    } else {
+                        let p = Protection {
+                            user_password: d.user.clone(),
+                            owner_password: d.owner.clone(),
+                            allow: d.allow,
+                        };
+                        self.protect_dialog = None;
+                        self.protect(p);
+                    }
+                }
+                Some(false) => self.protect_dialog = None,
+                None => {}
+            }
+        }
+
+        if let Some((sel, size)) = &mut self.compress_dialog {
+            let mut run = None;
+            egui::Modal::new(Id::new("compress")).show(ctx, |ui| {
+                ui.heading("Compress PDF");
+                ui.label(format!("Current size: {}", human(*size)));
+                ui.add_space(4.0);
+                for (i, (name, desc, _)) in COMPRESS_PRESETS.iter().enumerate() {
+                    ui.radio_value(sel, i, RichText::new(*name).strong());
+                    ui.label(RichText::new(*desc).small().weak());
+                }
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Compress").clicked() {
+                        run = Some(true);
+                    }
+                    if ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(Key::Escape)) {
+                        run = Some(false);
+                    }
+                });
+            });
+            match run {
+                Some(true) => {
+                    let opts = COMPRESS_PRESETS[*sel].2;
+                    self.compress_dialog = None;
+                    self.compress(opts);
+                }
+                Some(false) => self.compress_dialog = None,
+                None => {}
+            }
+        }
+    }
+
     fn finish(&mut self, ctx: &egui::Context, action: Pending) {
         if matches!(action, Pending::Quit) {
             self.allow_close = true;
@@ -1325,11 +1874,21 @@ impl eframe::App for App {
         if let Some(p) = dropped {
             self.request(Pending::Open(Some(p)));
         }
-        if self.pending.is_none() && self.password_prompt.is_none() && self.split_dialog.is_none() {
+        let modal = self.pending.is_some()
+            || self.password_prompt.is_some()
+            || self.split_dialog.is_some()
+            || self.sign_dialog.is_some()
+            || self.protect_dialog.is_some()
+            || self.compress_dialog.is_some();
+        if !modal {
             self.shortcuts(&ctx);
         }
+        // Only send the title when it changes: every viewport command wakes the event loop.
         let title = self.title();
-        ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
+        if title != self.last_title {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
+            self.last_title = title;
+        }
         if self.status.as_ref().is_some_and(|s| s.at.elapsed().as_secs() > 8 && !s.error) {
             self.status = None;
         }
@@ -1344,6 +1903,9 @@ impl eframe::App for App {
         if self.open.is_some() {
             egui::Panel::left("side").resizable(true).default_size(230.0).show(ui, |ui| self.side_panel(ui));
         }
+        if self.open.as_ref().is_some_and(|o| !o.fields.is_empty()) {
+            egui::Panel::top("formbar").show(ui, |ui| self.form_bar(ui));
+        }
         let bg = if ui.visuals().dark_mode { Color32::from_gray(40) } else { Color32::from_gray(200) };
         egui::CentralPanel::default().frame(egui::Frame::new().fill(bg)).show(ui, |ui| {
             if self.open.is_some() {
@@ -1353,6 +1915,31 @@ impl eframe::App for App {
             }
         });
         self.windows(&ctx);
+    }
+}
+
+/// Largest rect with `aspect` (width / height in points) centred inside `r` on a `pw` × `ph` page.
+fn fit_aspect(r: NormRect, aspect: f32, pw: f32, ph: f32) -> NormRect {
+    let (bw, bh) = ((r.x1 - r.x0) * pw, (r.y1 - r.y0) * ph);
+    let a = aspect.max(0.01);
+    let (w, h) = if bw / bh.max(1e-6) > a { (bh * a, bh) } else { (bw, bw / a) };
+    let (cx, cy) = ((r.x0 + r.x1) / 2.0 * pw, (r.y0 + r.y1) / 2.0 * ph);
+    NormRect { x0: (cx - w / 2.0) / pw, y0: (cy - h / 2.0) / ph, x1: (cx + w / 2.0) / pw, y1: (cy + h / 2.0) / ph }
+}
+
+fn field_tooltip(f: &FormField) -> String {
+    let mut t = format!("{} ({})", f.name, f.kind.label());
+    if f.required {
+        t.push_str(" · required");
+    }
+    t
+}
+
+fn human(n: usize) -> String {
+    match n {
+        n if n >= 1 << 20 => format!("{:.1} MB", n as f64 / (1 << 20) as f64),
+        n if n >= 1 << 10 => format!("{:.0} KB", n as f64 / 1024.0),
+        n => format!("{n} B"),
     }
 }
 
@@ -1448,6 +2035,94 @@ mod tests {
         assert_eq!(app.goto, Some(2));
         app.delete();
         assert!(app.search.hits.is_empty(), "edits invalidate hits");
+    }
+
+    fn form_app() -> App {
+        let ctx = egui::Context::default();
+        let mut app = App::new(&ctx, None);
+        let p = concat!(env!("CARGO_MANIFEST_DIR"), "/../pdfforge-core/tests/fixtures/form.pdf");
+        app.open = Some(Open::new(Document::open(p, None).unwrap(), None));
+        app
+    }
+
+    fn value(app: &App, name: &str) -> String {
+        app.open.as_ref().unwrap().fields.iter().find(|f| f.name == name).unwrap().value.clone()
+    }
+
+    #[test]
+    fn fills_form_fields_with_undo() {
+        let mut app = form_app();
+        assert_eq!(app.open.as_ref().unwrap().fields.len(), 5);
+        app.apply_page_action(PageAction::EditText(TextEditing {
+            name: "name".into(),
+            page: 0,
+            rect: NormRect { x0: 0.0, y0: 0.0, x1: 0.1, y1: 0.1 },
+            text: "Ada".into(),
+            multiline: false,
+            focus: false,
+        }));
+        app.apply_page_action(PageAction::CommitText);
+        assert_eq!(value(&app, "name"), "Ada");
+        app.apply_page_action(PageAction::Toggle("subscribe".into(), true));
+        app.apply_page_action(PageAction::Radio("plan".into(), "pro".into()));
+        assert_eq!(value(&app, "plan"), "pro");
+        assert!(app.open.as_ref().unwrap().fields.iter().find(|f| f.name == "subscribe").unwrap().checked);
+        app.undo_redo(false);
+        assert_eq!(value(&app, "plan"), "basic");
+        // Unchanged text does not create an undo step.
+        let steps = app.open.as_ref().unwrap().undo.len();
+        app.editing = Some(TextEditing {
+            name: "name".into(),
+            page: 0,
+            rect: NormRect { x0: 0.0, y0: 0.0, x1: 0.1, y1: 0.1 },
+            text: "Ada".into(),
+            multiline: false,
+            focus: false,
+        });
+        app.commit_text();
+        assert_eq!(app.open.as_ref().unwrap().undo.len(), steps);
+        app.flatten_form();
+        assert!(app.open.as_ref().unwrap().fields.is_empty());
+    }
+
+    #[test]
+    fn protects_and_undoes_protection() {
+        let mut app = app_with(2);
+        app.protect(Protection { user_password: "pw".into(), ..Default::default() });
+        let o = app.open.as_ref().unwrap();
+        assert!(o.encrypted);
+        assert!(Document::from_bytes(o.doc.to_bytes().unwrap(), None).is_err());
+        app.rotate(Rotation::R90);
+        app.undo_redo(false); // back to protected, unrotated
+        assert!(app.open.as_ref().unwrap().encrypted);
+        app.undo_redo(false); // back to unprotected
+        assert!(!app.open.as_ref().unwrap().encrypted);
+        app.undo_redo(true);
+        app.unprotect();
+        assert!(!app.open.as_ref().unwrap().encrypted);
+    }
+
+    #[test]
+    fn places_signatures_and_compresses() {
+        let mut app = app_with(1);
+        let sig =
+            Signature::Text { text: "Ada Lovelace".into(), font: pdfforge_core::StampFont::TimesItalic, color: [0; 3] };
+        app.placing = Some(sig);
+        app.apply_page_action(PageAction::Place(0, NormRect { x0: 0.5, y0: 0.8, x1: 0.9, y1: 0.86 }));
+        assert!(app.placing.is_none());
+        assert!(labels(&app)[0].contains("Ada Lovelace"));
+        app.compress(CompressOptions::LOSSLESS);
+        assert!(labels(&app)[0].contains("Ada Lovelace"));
+    }
+
+    #[test]
+    fn fits_signature_boxes() {
+        // A 4:1 signature in a 200x100 pt box becomes 200x50, centred.
+        let r = fit_aspect(NormRect { x0: 0.0, y0: 0.0, x1: 0.5, y1: 0.25 }, 4.0, 400.0, 400.0);
+        assert!(((r.x1 - r.x0) * 400.0 - 200.0).abs() < 0.01);
+        assert!(((r.y1 - r.y0) * 400.0 - 50.0).abs() < 0.01);
+        assert!((r.y0 * 400.0 - 25.0).abs() < 0.01);
+        assert_eq!(human(3 << 20), "3.0 MB");
     }
 
     #[test]

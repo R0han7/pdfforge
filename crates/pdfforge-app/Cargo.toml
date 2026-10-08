@@ -14,3 +14,4 @@ path = "src/main.rs"
 pdfforge-core = { path = "../pdfforge-core" }
 eframe = "=0.36.2"
 rfd = "=0.17.2"
+image = { version = "=0.25.10", default-features = false, features = ["png", "jpeg"] }

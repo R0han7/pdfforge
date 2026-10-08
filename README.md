@@ -16,6 +16,13 @@ built on Google's [PDFium](https://pdfium.googlesource.com/pdfium/) (the engine 
 - Page tools: rotate, delete, reorder, extract, insert blank pages or other PDFs, merge, split —
   with undo/redo in the app.
 - Export pages to PNG or JPEG.
+- **Fill forms**: click a field to type, tick, or pick an option; flatten the form when done.
+- **Sign**: draw, type or insert an image of your signature and click to place it. These are
+  visual signatures (like signing a printout), not certificate-based digital signatures.
+- **Password protection**: AES-256 encryption with optional permissions (printing, copying,
+  editing, …); remove protection from files you can open.
+- **Compress**: downsample and recompress images, remove unused objects; presets for screen,
+  print and smallest size.
 
 Status: early. Linux is the only tested platform so far.
 
@@ -59,6 +66,14 @@ pdfforge extract report.pdf "1-3,7,last" -o summary.pdf
 pdfforge rotate scan.pdf even 180 --in-place
 pdfforge split book.pdf --ranges "1-20;21-40;41-"
 pdfforge render slides.pdf -p 1-5 --dpi 200
+
+pdfforge fields form.pdf                                   # list fields, values and options
+pdfforge fill form.pdf name="Ada Lovelace" subscribe=yes plan=pro --flatten
+pdfforge sign contract.pdf --text "Ada Lovelace" -p last
+pdfforge sign contract.pdf --image signature.png --rect 350,650,180,50
+pdfforge protect report.pdf --user-password - --allow print   # reads the password from stdin
+pdfforge unprotect report.pdf --password - --in-place
+pdfforge compress scan.pdf --preset screen                 # or print, smallest, lossless
 ```
 
 Page ranges are one-based: `1-3,5`, `8-` (to the end), `-4`, `last`, `odd`, `even`, `all`,

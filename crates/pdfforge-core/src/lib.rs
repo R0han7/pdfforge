@@ -17,7 +17,10 @@
 //! # Ok::<(), pdfforge_core::Error>(())
 //! ```
 
+mod forms;
+mod lowlevel;
 mod ranges;
+mod stamp;
 
 use std::cell::Cell;
 use std::fmt;
@@ -27,7 +30,10 @@ use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use pdfium_render::prelude::*;
 
+pub use forms::{FieldKind, FieldValue, FormField};
+pub use lowlevel::{Allow, CompressOptions, CompressReport, Protection, Security};
 pub use ranges::{format_page_ranges, parse_page_ranges};
+pub use stamp::{Ink, StampFont};
 
 // ------------------------------------------------------------------ errors
 
@@ -39,8 +45,12 @@ pub enum Error {
     PasswordRequired,
     /// A page index or page range was out of bounds or malformed.
     InvalidPages(String),
+    /// A request that cannot be carried out (bad argument, unsupported field, ...).
+    Invalid(String),
     Io(std::io::Error),
     Pdfium(PdfiumError),
+    /// Error from the low-level PDF object layer (encryption, compression, form values).
+    Lopdf(String),
 }
 
 impl fmt::Display for Error {
@@ -55,6 +65,8 @@ impl fmt::Display for Error {
             }
             Error::PasswordRequired => write!(f, "this PDF is password protected; a valid password is required"),
             Error::InvalidPages(m) => write!(f, "invalid pages: {m}"),
+            Error::Invalid(m) => write!(f, "{m}"),
+            Error::Lopdf(m) => write!(f, "PDF error: {m}"),
             Error::Io(e) => write!(f, "{e}"),
             Error::Pdfium(e) => write!(f, "PDFium error: {e:?}"),
         }
@@ -266,6 +278,12 @@ pub struct Document {
     // Dropped explicitly in `Drop` while holding the PDFium lock.
     doc: ManuallyDrop<PdfDocument<'static>>,
     path: Option<PathBuf>,
+    /// Password the document was opened with (needed to re-open it after low-level edits).
+    password: Option<String>,
+    /// Exact bytes from the last low-level edit (e.g. compression with object streams), served
+    /// by `to_bytes` until PDFium modifies the document again. PDFium's own writer would undo
+    /// some of that work.
+    cached: Option<Vec<u8>>,
 }
 
 impl fmt::Debug for Document {
@@ -291,6 +309,7 @@ impl Document {
         let bytes = std::fs::read(path)?;
         let mut d = Self::from_bytes(bytes, password)?;
         d.path = Some(path.to_path_buf());
+        d.password = password.map(str::to_string);
         Ok(d)
     }
 
@@ -298,13 +317,13 @@ impl Document {
     pub fn from_bytes(bytes: Vec<u8>, password: Option<&str>) -> Result<Self> {
         let _g = lock();
         let doc = pdfium()?.load_pdf_from_byte_vec(bytes, password)?;
-        Ok(Self { doc: ManuallyDrop::new(doc), path: None })
+        Ok(Self { doc: ManuallyDrop::new(doc), path: None, password: password.map(str::to_string), cached: None })
     }
 
     /// A new document with no pages.
     pub fn new_empty() -> Result<Self> {
         let _g = lock();
-        Ok(Self { doc: ManuallyDrop::new(pdfium()?.create_new_pdf()?), path: None })
+        Ok(Self { doc: ManuallyDrop::new(pdfium()?.create_new_pdf()?), path: None, password: None, cached: None })
     }
 
     /// The file this document was opened from, if any.
@@ -358,11 +377,12 @@ impl Document {
             modified: tag(PdfDocumentMetadataTagType::ModificationDate),
             pages: self.page_count(),
             version: version_string(self.doc.version()),
-            encrypted: self
-                .doc
-                .permissions()
-                .security_handler_revision()
-                .is_ok_and(|r| !matches!(r, pdfium_render::prelude::PdfSecurityHandlerRevision::Unprotected)),
+            // pdfium-render reports AES-256 (revision 6) as an unknown revision, which still
+            // means "encrypted".
+            encrypted: !matches!(
+                self.doc.permissions().security_handler_revision(),
+                Ok(PdfSecurityHandlerRevision::Unprotected)
+            ),
         }
     }
 
@@ -431,6 +451,13 @@ impl Document {
         Ok(hits)
     }
 
+    /// Whether the document has an interactive (AcroForm) form. Cheap; use it before
+    /// [`Document::form_fields`] on large documents.
+    pub fn has_form(&self) -> bool {
+        let _g = lock();
+        self.doc.form().is_some_and(|f| !matches!(f.form_type(), PdfFormType::None))
+    }
+
     /// Bookmarks, flattened depth-first.
     pub fn outline(&self) -> Vec<OutlineItem> {
         let _g = lock();
@@ -461,6 +488,7 @@ impl Document {
     /// Rotate pages clockwise by `by` (relative to their current rotation).
     pub fn rotate_pages(&mut self, pages: &[usize], by: Rotation) -> Result<()> {
         let _g = lock();
+        self.touch();
         self.check_all(pages)?;
         for &i in pages {
             let mut p = self.doc.pages().get(i as i32)?;
@@ -474,6 +502,7 @@ impl Document {
     /// Delete pages. Deleting every page is refused, since an empty PDF is not useful.
     pub fn delete_pages(&mut self, pages: &[usize]) -> Result<()> {
         let _g = lock();
+        self.touch();
         self.check_all(pages)?;
         let mut sorted = pages.to_vec();
         sorted.sort_unstable();
@@ -490,6 +519,7 @@ impl Document {
     /// Copy all pages of `other` into this document before page `at` (`at == page_count()` appends).
     pub fn insert_document(&mut self, other: &Document, at: usize) -> Result<()> {
         let _g = lock();
+        self.touch();
         if at > self.page_count() {
             return Err(Error::InvalidPages(format!("insert position {} is past the end", at + 1)));
         }
@@ -504,6 +534,7 @@ impl Document {
     /// Insert a blank page before `at`, sized like the neighbouring page (or US Letter).
     pub fn insert_blank_page(&mut self, at: usize) -> Result<()> {
         let _g = lock();
+        self.touch();
         if at > self.page_count() {
             return Err(Error::InvalidPages(format!("insert position {} is past the end", at + 1)));
         }
@@ -556,6 +587,7 @@ impl Document {
         {
             return Err(Error::InvalidPages("new order must list every page exactly once".into()));
         }
+        self.touch();
         let mut new = self.extract(order)?;
         std::mem::swap(&mut self.doc, &mut new.doc); // the old pages drop with `new`
         Ok(())
@@ -592,7 +624,30 @@ impl Document {
 
     pub fn to_bytes(&self) -> Result<Vec<u8>> {
         let _g = lock();
+        if let Some(b) = &self.cached {
+            return Ok(b.clone());
+        }
         Ok(self.doc.save_to_bytes()?)
+    }
+
+    /// Swap in a new serialisation of this document (after a low-level edit), keeping the path.
+    fn replace_bytes(&mut self, bytes: Vec<u8>, password: Option<String>) -> Result<()> {
+        let _g = lock();
+        let mut new = Document::from_bytes(bytes.clone(), password.as_deref())?;
+        std::mem::swap(&mut self.doc, &mut new.doc);
+        self.password = password;
+        self.cached = Some(bytes);
+        Ok(())
+    }
+
+    /// Call before any PDFium-side modification: cached low-level bytes become stale.
+    fn touch(&mut self) {
+        self.cached = None;
+    }
+
+    /// The password the document was opened (or last protected) with.
+    pub fn password(&self) -> Option<&str> {
+        self.password.as_deref()
     }
 
     /// Save to `path`. Writes to a temporary file first and renames, so the original is never
