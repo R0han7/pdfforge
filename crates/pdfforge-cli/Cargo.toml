@@ -1,0 +1,15 @@
+[package]
+name = "pdfforge-cli"
+description = "pdfforge command-line PDF toolkit"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "pdfforge"
+path = "src/main.rs"
+
+[dependencies]
+pdfforge-core = { path = "../pdfforge-core" }
+image = { version = "=0.25.10", default-features = false, features = ["png", "jpeg"] }

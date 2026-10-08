@@ -1,0 +1,10 @@
+[package]
+name = "pdfforge-core"
+description = "PDF Forge core: open, render, search and edit PDF documents (PDFium)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+pdfium-render.workspace = true

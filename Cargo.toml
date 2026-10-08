@@ -1,0 +1,16 @@
+[workspace]
+resolver = "3"
+members = ["crates/pdfforge-core", "crates/pdfforge-cli", "crates/pdfforge-app"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/R0han7/pdfforge"
+
+[workspace.dependencies]
+pdfium-render = "=0.9.4"
+
+[profile.release]
+lto = "thin"

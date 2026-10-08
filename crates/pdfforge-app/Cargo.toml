@@ -1,0 +1,16 @@
+[package]
+name = "pdfforge-app"
+description = "PDF Forge desktop PDF viewer and editor"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "pdfforge-app"
+path = "src/main.rs"
+
+[dependencies]
+pdfforge-core = { path = "../pdfforge-core" }
+eframe = "=0.36.2"
+rfd = "=0.17.2"
